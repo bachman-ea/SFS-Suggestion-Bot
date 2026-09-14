@@ -52,15 +52,16 @@ async def _copy_messages(bot, chat_id, from_chat_id, message_ids):
 
 async def _publish(context: ContextTypes.DEFAULT_TYPE, data: dict):
     try:
-        group_message_id = data["group_message_id"]
-        parts = context.bot_data.get("album_parts", {}).get(group_message_id)
-        if not parts:
-            parts = [group_message_id]
+        user_message_id = data["user_message_id"]
+        media_ids = context.bot_data.get("post_media", {}).get(user_message_id)
+        if not media_ids:
+            media_ids = [data["group_message_id"]]
 
-        sent_ids = await _copy_messages(context.bot, CHANNEL_ID, GROUP_ID, parts)
-        message_id = sent_ids[-1]
+        sent_ids = await _copy_messages(context.bot, CHANNEL_ID, GROUP_ID, media_ids)
+        if not sent_ids:
+            raise RuntimeError("Не удалось скопировать сообщения в канал")
 
-        content = context.bot_data.get("post_content", {}).get(data["user_message_id"], {})
+        content = context.bot_data.get("post_content", {}).get(user_message_id, {})
         original_text = content.get("text")
         original_caption = content.get("caption")
         caption_index = content.get("caption_index", 0)
@@ -109,7 +110,7 @@ async def _publish(context: ContextTypes.DEFAULT_TYPE, data: dict):
                     print(f"Не удалось отправить автора отдельно: {e2}")
 
         accepted_notify = context.bot_data.setdefault("accepted_notify", {})
-        prev_id = accepted_notify.pop(data["user_message_id"], None)
+        prev_id = accepted_notify.pop(user_message_id, None)
 
         if prev_id is not None:
             try:
@@ -124,7 +125,7 @@ async def _publish(context: ContextTypes.DEFAULT_TYPE, data: dict):
                     await context.bot.send_message(
                         chat_id=user_id,
                         text="✅ Ваш пост опубликован в канале",
-                        reply_to_message_id=data["user_message_id"],
+                        reply_to_message_id=user_message_id,
                     )
                 except Exception as e2:
                     print(f"Не удалось уведомить {user_id}: {e2}")
@@ -132,17 +133,17 @@ async def _publish(context: ContextTypes.DEFAULT_TYPE, data: dict):
             await context.bot.send_message(
                 chat_id=user_id,
                 text="✅ Ваш пост опубликован в канале",
-                reply_to_message_id=data["user_message_id"],
+                reply_to_message_id=user_message_id,
             )
 
         if data.get("admin_chat_id"):
             await context.bot.send_message(
                 chat_id=data["admin_chat_id"],
                 text="Пост опубликован в канале",
-                reply_to_message_id=group_message_id,
+                reply_to_message_id=data["group_message_id"],
             )
 
-        context.bot_data.get("album_parts", {}).pop(group_message_id, None)
+        context.bot_data.get("post_media", {}).pop(user_message_id, None)
     except Exception as e:
         print(f"Ошибка публикации: {e}")
         if data.get("admin_chat_id"):
@@ -285,6 +286,11 @@ async def _process_album(context: ContextTypes.DEFAULT_TYPE, entry: dict):
     except Exception as e:
         print(f"Не удалось скопировать альбом в группу: {e}")
         return
+    if not copied_ids:
+        print("Не удалось скопировать альбом: пустой результат")
+        return
+
+    context.bot_data.setdefault("post_media", {})[primary_uid] = copied_ids
 
     keyboard = InlineKeyboardMarkup([
         [
@@ -294,17 +300,14 @@ async def _process_album(context: ContextTypes.DEFAULT_TYPE, entry: dict):
     ])
 
     try:
-        sent = await context.bot.send_message(
+        await context.bot.send_message(
             chat_id=GROUP_ID,
-            text=f"📎 Альбом ({len(messages)} шт.)",
+            text=f"📎 Альбом ({len(messages)} шт.) — выберите действие:",
             reply_to_message_id=copied_ids[-1],
             reply_markup=keyboard,
         )
     except Exception as e:
         print(f"Не удалось отправить кнопки для альбома: {e}")
-        return
-
-    context.bot_data.setdefault("album_parts", {})[sent.message_id] = copied_ids
 
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -327,7 +330,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await message.reply_text("Пост принят в обработку администрацией")
 
-    await context.bot.copy_message(
+    sent = await context.bot.copy_message(
         chat_id=GROUP_ID,
         from_chat_id=message.chat_id,
         message_id=user_message_id,
@@ -338,6 +341,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
         ]),
     )
+    context.bot_data.setdefault("post_media", {})[user_message_id] = [sent.message_id]
 
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -385,9 +389,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, user_id_str, user_message_id_str = data.split(":")
         user_id = int(user_id_str)
         user_message_id = int(user_message_id_str)
-        group_message_id = query.message.message_id
-
-        context.bot_data.get("album_parts", {}).pop(group_message_id, None)
 
         await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text("Пост отклонён")
