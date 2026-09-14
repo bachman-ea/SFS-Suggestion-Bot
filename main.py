@@ -6,8 +6,8 @@ from telegram.ext import (
     CallbackQueryHandler,
     filters,
 )
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
-from datetime import datetime
 import html
 import os
 
@@ -19,6 +19,7 @@ GROUP_ID = int(os.environ.get("GROUP_ID"))
 CHANNEL_ID = int(os.environ.get("CHANNEL_ID"))
 
 TIME_FORMAT = "%d.%m.%Y %H:%M"
+MSK = timezone(timedelta(hours=3))
 
 
 async def _publish(context: ContextTypes.DEFAULT_TYPE, data: dict):
@@ -133,9 +134,9 @@ async def schedule_time_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
     text = (update.message.text or "").strip()
     try:
-        dt = datetime.strptime(text, TIME_FORMAT)
+        dt = datetime.strptime(text, TIME_FORMAT).replace(tzinfo=MSK)
     except ValueError:
-        example_dt = datetime.now().strftime(TIME_FORMAT)
+        example_dt = datetime.now(MSK).strftime(TIME_FORMAT)
         await update.message.reply_text(
             "Неверный формат. Отправьте дату и время так:\n"
             f"`{TIME_FORMAT}`\nНапример: {example_dt}",
@@ -143,7 +144,7 @@ async def schedule_time_handler(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
-    now = datetime.now()
+    now = datetime.now(MSK)
     if dt <= now:
         await update.message.reply_text("Это время уже прошло, укажите ещё раз")
         return
@@ -169,7 +170,7 @@ async def schedule_time_handler(update: Update, context: ContextTypes.DEFAULT_TY
     )
     context.user_data.pop("pending_schedule", None)
     await update.message.reply_text(
-        f"✅ Публикация запланирована на {dt.strftime(TIME_FORMAT)}"
+        f"✅ Публикация запланирована на {dt.strftime(TIME_FORMAT)} (МСК)"
     )
 
 
@@ -270,7 +271,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data.startswith("pub_custom:"):
             await query.edit_message_reply_markup(reply_markup=None)
             context.user_data["pending_schedule"] = payload
-            example_dt = datetime.now().strftime(TIME_FORMAT)
+            example_dt = datetime.now(MSK).strftime(TIME_FORMAT)
             await query.message.reply_text(
                 "Отправьте дату и время публикации в формате:\n"
                 f"`{TIME_FORMAT}`\nНапример: {example_dt}",
