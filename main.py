@@ -1,3 +1,9 @@
+import asyncio
+import html
+import os
+from datetime import datetime, timezone, timedelta
+
+from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -6,10 +12,6 @@ from telegram.ext import (
     CallbackQueryHandler,
     filters,
 )
-from datetime import datetime, timezone, timedelta
-from dotenv import load_dotenv
-import html
-import os
 
 
 load_dotenv()
@@ -21,20 +23,47 @@ CHANNEL_ID = int(os.environ.get("CHANNEL_ID"))
 TIME_FORMAT = "%d.%m.%Y %H:%M"
 MSK = timezone(timedelta(hours=3))
 
+ALBUM_DELAY = 2.0
+
+
+async def _copy_messages(bot, chat_id, from_chat_id, message_ids):
+    try:
+        copied = await bot.copy_messages(
+            chat_id=chat_id,
+            from_chat_id=from_chat_id,
+            message_ids=message_ids,
+        )
+        return [m.message_id for m in copied]
+    except AttributeError:
+        pass
+    except Exception as e:
+        print(f"copy_messages не сработал ({e}); fallback на copy_message")
+
+    result = []
+    for mid in message_ids:
+        sent = await bot.copy_message(
+            chat_id=chat_id,
+            from_chat_id=from_chat_id,
+            message_id=mid,
+        )
+        result.append(sent.message_id)
+    return result
+
 
 async def _publish(context: ContextTypes.DEFAULT_TYPE, data: dict):
     try:
-        sent = await context.bot.copy_message(
-            chat_id=CHANNEL_ID,
-            from_chat_id=GROUP_ID,
-            message_id=data["group_message_id"],
-            reply_markup=None,
-        )
-        message_id = sent.message_id
+        group_message_id = data["group_message_id"]
+        parts = context.bot_data.get("album_parts", {}).get(group_message_id)
+        if not parts:
+            parts = [group_message_id]
+
+        sent_ids = await _copy_messages(context.bot, CHANNEL_ID, GROUP_ID, parts)
+        message_id = sent_ids[-1]
 
         content = context.bot_data.get("post_content", {}).get(data["user_message_id"], {})
         original_text = content.get("text")
         original_caption = content.get("caption")
+        caption_index = content.get("caption_index", 0)
 
         user_id = data["user_id"]
         try:
@@ -49,7 +78,7 @@ async def _publish(context: ContextTypes.DEFAULT_TYPE, data: dict):
             try:
                 await context.bot.edit_message_text(
                     chat_id=CHANNEL_ID,
-                    message_id=message_id,
+                    message_id=sent_ids[0],
                     text=html.escape(original_text) + author_line,
                     parse_mode="HTML",
                 )
@@ -60,10 +89,11 @@ async def _publish(context: ContextTypes.DEFAULT_TYPE, data: dict):
                 caption = html.escape(original_caption) + author_line
             else:
                 caption = author_line.strip()
+            target_id = sent_ids[min(caption_index, len(sent_ids) - 1)]
             try:
                 await context.bot.edit_message_caption(
                     chat_id=CHANNEL_ID,
-                    message_id=message_id,
+                    message_id=target_id,
                     caption=caption,
                     parse_mode="HTML",
                 )
@@ -104,12 +134,15 @@ async def _publish(context: ContextTypes.DEFAULT_TYPE, data: dict):
                 text="✅ Ваш пост опубликован в канале",
                 reply_to_message_id=data["user_message_id"],
             )
+
         if data.get("admin_chat_id"):
             await context.bot.send_message(
                 chat_id=data["admin_chat_id"],
                 text="Пост опубликован в канале",
-                reply_to_message_id=data["group_message_id"],
+                reply_to_message_id=group_message_id,
             )
+
+        context.bot_data.get("album_parts", {}).pop(group_message_id, None)
     except Exception as e:
         print(f"Ошибка публикации: {e}")
         if data.get("admin_chat_id"):
@@ -174,20 +207,129 @@ async def schedule_time_handler(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    user_message_id = update.message.message_id
+async def _buffer_album_message(context: ContextTypes.DEFAULT_TYPE, message):
+    media_group_id = message.media_group_id
+    groups = context.bot_data.setdefault("media_groups", {})
 
-    context.bot_data.setdefault("post_content", {})[user_message_id] = {
-        "text": update.message.text,
-        "caption": update.message.caption,
+    entry = groups.get(media_group_id)
+    if entry is None:
+        entry = {
+            "messages": [],
+            "user_id": message.from_user.id,
+            "chat_id": message.chat_id,
+            "generation": 0,
+        }
+        groups[media_group_id] = entry
+
+    entry["messages"].append({
+        "message_id": message.message_id,
+        "text": message.text,
+        "caption": message.caption,
+    })
+    entry["generation"] += 1
+    gen = entry["generation"]
+
+    asyncio.create_task(_finish_album(context, media_group_id, gen))
+
+
+async def _finish_album(context: ContextTypes.DEFAULT_TYPE, media_group_id, generation):
+    await asyncio.sleep(ALBUM_DELAY)
+    groups = context.bot_data.get("media_groups", {})
+    entry = groups.get(media_group_id)
+    if entry is None or entry.get("generation") != generation:
+        return
+    groups.pop(media_group_id, None)
+
+    try:
+        await _process_album(context, entry)
+    except Exception as e:
+        print(f"Ошибка обработки альбома: {e}")
+
+
+async def _process_album(context: ContextTypes.DEFAULT_TYPE, entry: dict):
+    messages = entry["messages"]
+    user_id = entry["user_id"]
+    chat_id = entry["chat_id"]
+    if not messages:
+        return
+
+    text = None
+    caption = None
+    caption_index = 0
+    for i, m in enumerate(messages):
+        if m.get("text"):
+            text = m["text"]
+        if m.get("caption"):
+            caption = m["caption"]
+            caption_index = i
+
+    primary_uid = messages[0]["message_id"]
+    context.bot_data.setdefault("post_content", {})[primary_uid] = {
+        "text": text,
+        "caption": caption,
+        "caption_index": caption_index,
     }
 
-    await update.message.reply_text("Пост принят в обработку администрацией")
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Пост принят в обработку администрацией",
+            reply_to_message_id=primary_uid,
+        )
+    except Exception as e:
+        print(f"Не удалось уведомить пользователя: {e}")
+
+    message_ids = [m["message_id"] for m in messages]
+    try:
+        copied_ids = await _copy_messages(context.bot, GROUP_ID, chat_id, message_ids)
+    except Exception as e:
+        print(f"Не удалось скопировать альбом в группу: {e}")
+        return
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅", callback_data=f"accept:{user_id}:{primary_uid}"),
+            InlineKeyboardButton("❌", callback_data=f"reject:{user_id}:{primary_uid}"),
+        ]
+    ])
+
+    try:
+        sent = await context.bot.send_message(
+            chat_id=GROUP_ID,
+            text=f"📎 Альбом ({len(messages)} шт.)",
+            reply_to_message_id=copied_ids[-1],
+            reply_markup=keyboard,
+        )
+    except Exception as e:
+        print(f"Не удалось отправить кнопки для альбома: {e}")
+        return
+
+    context.bot_data.setdefault("album_parts", {})[sent.message_id] = copied_ids
+
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if message is None:
+        return
+
+    if message.media_group_id:
+        await _buffer_album_message(context, message)
+        return
+
+    user_id = message.from_user.id
+    user_message_id = message.message_id
+
+    context.bot_data.setdefault("post_content", {})[user_message_id] = {
+        "text": message.text,
+        "caption": message.caption,
+        "caption_index": 0,
+    }
+
+    await message.reply_text("Пост принят в обработку администрацией")
 
     await context.bot.copy_message(
         chat_id=GROUP_ID,
-        from_chat_id=update.message.chat_id,
+        from_chat_id=message.chat_id,
         message_id=user_message_id,
         reply_markup=InlineKeyboardMarkup([
             [
@@ -243,6 +385,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, user_id_str, user_message_id_str = data.split(":")
         user_id = int(user_id_str)
         user_message_id = int(user_message_id_str)
+        group_message_id = query.message.message_id
+
+        context.bot_data.get("album_parts", {}).pop(group_message_id, None)
+
         await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text("Пост отклонён")
         try:
