@@ -14,7 +14,7 @@ import os
 
 load_dotenv()
 
-TOKEN = os.environ.get("TOKEN")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 GROUP_ID = int(os.environ.get("GROUP_ID"))
 CHANNEL_ID = int(os.environ.get("CHANNEL_ID"))
 
@@ -272,7 +272,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    if TOKEN is None:
+    if BOT_TOKEN is None:
         print('Токен не указан в .env: TOKEN = "..."')
         exit()
     if GROUP_ID is None:
@@ -282,7 +282,7 @@ def main():
         print('ID канала не указан в .env: CHANNEL_ID = "-100..."')
         exit()
 
-    app = ApplicationBuilder().token(TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, schedule_time_handler))
     app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, message_handler))
