@@ -5,6 +5,7 @@ from datetime import datetime, timezone, timedelta
 
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+
 from telegram.ext import (
     ApplicationBuilder,
     MessageHandler,
@@ -24,6 +25,12 @@ TIME_FORMAT = "%d.%m.%Y %H:%M"
 MSK = timezone(timedelta(hours=3))
 
 ALBUM_DELAY = 2.0
+
+
+def _is_not_modified(exc: Exception) -> bool:
+    if type(exc).__name__ == "MessageNotModified":
+        return True
+    return "message is not modified" in str(exc).lower()
 
 
 async def _copy_messages(bot, chat_id, from_chat_id, message_ids):
@@ -53,10 +60,20 @@ async def _copy_messages(bot, chat_id, from_chat_id, message_ids):
 async def _publish(context: ContextTypes.DEFAULT_TYPE, data: dict):
     user_message_id = data["user_message_id"]
     group_message_id = data["group_message_id"]
+    user_id = data["user_id"]
+    key = (user_id, user_message_id)
+
+    published = context.bot_data.setdefault("published_posts", set())
+    if key in published:
+        print(f"Пост {key} уже опубликован — повторный запуск игнорируем")
+        return
+    published.add(key)
+
+    sent_to_channel = False
     try:
         sent_ids = None
 
-        source = context.bot_data.get("post_source", {}).get(user_message_id)
+        source = context.bot_data.get("post_source", {}).get(key)
         if source:
             try:
                 sent_ids = await _copy_messages(
@@ -70,7 +87,7 @@ async def _publish(context: ContextTypes.DEFAULT_TYPE, data: dict):
                 sent_ids = None
 
         if not sent_ids:
-            media_ids = context.bot_data.get("post_media", {}).get(user_message_id)
+            media_ids = context.bot_data.get("post_media", {}).get(key)
             if not media_ids:
                 media_ids = [group_message_id]
             sent_ids = await _copy_messages(context.bot, CHANNEL_ID, GROUP_ID, media_ids)
@@ -78,12 +95,13 @@ async def _publish(context: ContextTypes.DEFAULT_TYPE, data: dict):
         if not sent_ids:
             raise RuntimeError("Не удалось скопировать сообщения в канал")
 
-        content = context.bot_data.get("post_content", {}).get(user_message_id, {})
+        sent_to_channel = True
+
+        content = context.bot_data.get("post_content", {}).get(key, {})
         original_text = content.get("text")
         original_caption = content.get("caption")
         caption_index = content.get("caption_index", 0)
 
-        user_id = data["user_id"]
         try:
             chat = await context.bot.get_chat(user_id)
             name = chat.full_name or chat.first_name or "Автор"
@@ -101,7 +119,8 @@ async def _publish(context: ContextTypes.DEFAULT_TYPE, data: dict):
                     parse_mode="HTML",
                 )
             except Exception as e:
-                print(f"Не удалось добавить автора: {e}")
+                if not _is_not_modified(e):
+                    print(f"Не удалось добавить автора: {e}")
         else:
             if original_caption:
                 caption = html.escape(original_caption) + author_line
@@ -116,18 +135,11 @@ async def _publish(context: ContextTypes.DEFAULT_TYPE, data: dict):
                     parse_mode="HTML",
                 )
             except Exception as e:
-                print(f"Не удалось добавить подпись: {e}")
-                try:
-                    await context.bot.send_message(
-                        chat_id=CHANNEL_ID,
-                        text=author_line.strip(),
-                        parse_mode="HTML",
-                    )
-                except Exception as e2:
-                    print(f"Не удалось отправить автора отдельно: {e2}")
+                if not _is_not_modified(e):
+                    print(f"Не удалось добавить подпись: {e}")
 
         accepted_notify = context.bot_data.setdefault("accepted_notify", {})
-        prev_id = accepted_notify.pop(user_message_id, None)
+        prev_id = accepted_notify.pop(key, None)
 
         if prev_id is not None:
             try:
@@ -137,21 +149,25 @@ async def _publish(context: ContextTypes.DEFAULT_TYPE, data: dict):
                     text="✅ Ваш пост опубликован в канале",
                 )
             except Exception as e:
-                print(f"Не удалось обновить уведомление: {e}")
-                try:
-                    await context.bot.send_message(
-                        chat_id=user_id,
-                        text="✅ Ваш пост опубликован в канале",
-                        reply_to_message_id=user_message_id,
-                    )
-                except Exception as e2:
-                    print(f"Не удалось уведомить {user_id}: {e2}")
+                if not _is_not_modified(e):
+                    print(f"Не удалось обновить уведомление: {e}")
+                    try:
+                        await context.bot.send_message(
+                            chat_id=user_id,
+                            text="✅ Ваш пост опубликован в канале",
+                            reply_to_message_id=user_message_id,
+                        )
+                    except Exception as e2:
+                        print(f"Не удалось уведомить {user_id}: {e2}")
         else:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text="✅ Ваш пост опубликован в канале",
-                reply_to_message_id=user_message_id,
-            )
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text="✅ Ваш пост опубликован в канале",
+                    reply_to_message_id=user_message_id,
+                )
+            except Exception as e:
+                print(f"Не удалось уведомить {user_id}: {e}")
 
         if data.get("admin_chat_id"):
             await context.bot.send_message(
@@ -160,11 +176,13 @@ async def _publish(context: ContextTypes.DEFAULT_TYPE, data: dict):
                 reply_to_message_id=group_message_id,
             )
 
-        context.bot_data.get("post_media", {}).pop(user_message_id, None)
-        context.bot_data.get("post_source", {}).pop(user_message_id, None)
-        context.bot_data.get("post_content", {}).pop(user_message_id, None)
+        context.bot_data.get("post_media", {}).pop(key, None)
+        context.bot_data.get("post_source", {}).pop(key, None)
+        context.bot_data.get("post_content", {}).pop(key, None)
 
     except Exception as e:
+        if not sent_to_channel:
+            published.discard(key)
         print(f"Ошибка публикации: {e}")
         if data.get("admin_chat_id"):
             try:
@@ -285,7 +303,8 @@ async def _process_album(context: ContextTypes.DEFAULT_TYPE, entry: dict):
             caption_index = i
 
     primary_uid = messages[0]["message_id"]
-    context.bot_data.setdefault("post_content", {})[primary_uid] = {
+    key = (user_id, primary_uid)
+    context.bot_data.setdefault("post_content", {})[key] = {
         "text": text,
         "caption": caption,
         "caption_index": caption_index,
@@ -310,8 +329,8 @@ async def _process_album(context: ContextTypes.DEFAULT_TYPE, entry: dict):
         print("Не удалось скопировать альбом: пустой результат")
         return
 
-    context.bot_data.setdefault("post_media", {})[primary_uid] = copied_ids
-    context.bot_data.setdefault("post_source", {})[primary_uid] = {
+    context.bot_data.setdefault("post_media", {})[key] = copied_ids
+    context.bot_data.setdefault("post_source", {})[key] = {
         "chat_id": chat_id,
         "message_ids": message_ids,
     }
@@ -345,8 +364,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = message.from_user.id
     user_message_id = message.message_id
+    key = (user_id, user_message_id)
 
-    context.bot_data.setdefault("post_content", {})[user_message_id] = {
+    context.bot_data.setdefault("post_content", {})[key] = {
         "text": message.text,
         "caption": message.caption,
         "caption_index": 0,
@@ -365,8 +385,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
         ]),
     )
-    context.bot_data.setdefault("post_media", {})[user_message_id] = [sent.message_id]
-    context.bot_data.setdefault("post_source", {})[user_message_id] = {
+    context.bot_data.setdefault("post_media", {})[key] = [sent.message_id]
+    context.bot_data.setdefault("post_source", {})[key] = {
         "chat_id": message.chat_id,
         "message_ids": [user_message_id],
     }
@@ -382,6 +402,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         group_message_id = query.message.message_id
         user_id = int(user_id_str)
         user_message_id = int(user_message_id_str)
+        key = (user_id, user_message_id)
 
         try:
             notify = await context.bot.send_message(
@@ -389,7 +410,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text="✅ Ваш пост принят и будет опубликован в канале",
                 reply_to_message_id=user_message_id,
             )
-            context.bot_data.setdefault("accepted_notify", {})[user_message_id] = notify.message_id
+            context.bot_data.setdefault("accepted_notify", {})[key] = notify.message_id
         except Exception as e:
             print(f"Не удалось уведомить {user_id}: {e}")
 
@@ -418,7 +439,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = int(user_id_str)
         user_message_id = int(user_message_id_str)
 
-        await query.edit_message_reply_markup(reply_markup=None)
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([]))
         await query.message.reply_text("Пост отклонён")
         try:
             await context.bot.send_message(
@@ -444,7 +465,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
 
         if data.startswith("pub_custom:"):
-            await query.edit_message_reply_markup(reply_markup=None)
+            await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([]))
             context.user_data["pending_schedule"] = payload
             example_dt = datetime.now(MSK).strftime(TIME_FORMAT)
             await query.message.reply_text(
@@ -461,7 +482,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if data.startswith("pub_now:"):
-            await query.edit_message_reply_markup(reply_markup=None)
+            await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([]))
             await _publish(context, payload)
             return
 
@@ -471,7 +492,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             delay = 3600
             label = "1 ч."
-        await query.edit_message_reply_markup(reply_markup=None)
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([]))
         context.job_queue.run_once(
             publish_job,
             when=delay,
@@ -483,7 +504,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     if BOT_TOKEN is None:
-        print('Токен не указан в .env: TOKEN = "..."')
+        print('Токен не указан в .env: BOT_TOKEN = "..."')
         exit()
     if GROUP_ID is None:
         print('ID группы не указан в .env: GROUP_ID = "-100..."')
