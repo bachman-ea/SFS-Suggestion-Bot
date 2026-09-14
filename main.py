@@ -51,13 +51,30 @@ async def _copy_messages(bot, chat_id, from_chat_id, message_ids):
 
 
 async def _publish(context: ContextTypes.DEFAULT_TYPE, data: dict):
+    user_message_id = data["user_message_id"]
+    group_message_id = data["group_message_id"]
     try:
-        user_message_id = data["user_message_id"]
-        media_ids = context.bot_data.get("post_media", {}).get(user_message_id)
-        if not media_ids:
-            media_ids = [data["group_message_id"]]
+        sent_ids = None
 
-        sent_ids = await _copy_messages(context.bot, CHANNEL_ID, GROUP_ID, media_ids)
+        source = context.bot_data.get("post_source", {}).get(user_message_id)
+        if source:
+            try:
+                sent_ids = await _copy_messages(
+                    context.bot,
+                    CHANNEL_ID,
+                    source["chat_id"],
+                    source["message_ids"],
+                )
+            except Exception as e:
+                print(f"Не удалось скопировать пост из источника: {e}")
+                sent_ids = None
+
+        if not sent_ids:
+            media_ids = context.bot_data.get("post_media", {}).get(user_message_id)
+            if not media_ids:
+                media_ids = [group_message_id]
+            sent_ids = await _copy_messages(context.bot, CHANNEL_ID, GROUP_ID, media_ids)
+
         if not sent_ids:
             raise RuntimeError("Не удалось скопировать сообщения в канал")
 
@@ -75,7 +92,7 @@ async def _publish(context: ContextTypes.DEFAULT_TYPE, data: dict):
 
         author_line = f'\n\nОт: <a href="tg://user?id={user_id}">{html.escape(name)}</a>'
 
-        if original_text is not None:
+        if original_text is not None and len(sent_ids) == 1:
             try:
                 await context.bot.edit_message_text(
                     chat_id=CHANNEL_ID,
@@ -140,10 +157,13 @@ async def _publish(context: ContextTypes.DEFAULT_TYPE, data: dict):
             await context.bot.send_message(
                 chat_id=data["admin_chat_id"],
                 text="Пост опубликован в канале",
-                reply_to_message_id=data["group_message_id"],
+                reply_to_message_id=group_message_id,
             )
 
         context.bot_data.get("post_media", {}).pop(user_message_id, None)
+        context.bot_data.get("post_source", {}).pop(user_message_id, None)
+        context.bot_data.get("post_content", {}).pop(user_message_id, None)
+
     except Exception as e:
         print(f"Ошибка публикации: {e}")
         if data.get("admin_chat_id"):
@@ -151,7 +171,7 @@ async def _publish(context: ContextTypes.DEFAULT_TYPE, data: dict):
                 await context.bot.send_message(
                     chat_id=data["admin_chat_id"],
                     text=f"⚠️ Не удалось опубликовать пост: {e}",
-                    reply_to_message_id=data["group_message_id"],
+                    reply_to_message_id=group_message_id,
                 )
             except Exception:
                 pass
@@ -291,6 +311,10 @@ async def _process_album(context: ContextTypes.DEFAULT_TYPE, entry: dict):
         return
 
     context.bot_data.setdefault("post_media", {})[primary_uid] = copied_ids
+    context.bot_data.setdefault("post_source", {})[primary_uid] = {
+        "chat_id": chat_id,
+        "message_ids": message_ids,
+    }
 
     keyboard = InlineKeyboardMarkup([
         [
@@ -342,6 +366,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]),
     )
     context.bot_data.setdefault("post_media", {})[user_message_id] = [sent.message_id]
+    context.bot_data.setdefault("post_source", {})[user_message_id] = {
+        "chat_id": message.chat_id,
+        "message_ids": [user_message_id],
+    }
 
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
