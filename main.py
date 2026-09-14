@@ -77,11 +77,32 @@ async def _publish(context: ContextTypes.DEFAULT_TYPE, data: dict):
                 except Exception as e2:
                     print(f"Не удалось отправить автора отдельно: {e2}")
 
-        await context.bot.send_message(
-            chat_id=user_id,
-            text="✅ Ваш пост опубликован в канале",
-            reply_to_message_id=data["user_message_id"],
-        )
+        accepted_notify = context.bot_data.setdefault("accepted_notify", {})
+        prev_id = accepted_notify.pop(data["user_message_id"], None)
+
+        if prev_id is not None:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=user_id,
+                    message_id=prev_id,
+                    text="✅ Ваш пост опубликован в канале",
+                )
+            except Exception as e:
+                print(f"Не удалось обновить уведомление: {e}")
+                try:
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text="✅ Ваш пост опубликован в канале",
+                        reply_to_message_id=data["user_message_id"],
+                    )
+                except Exception as e2:
+                    print(f"Не удалось уведомить {user_id}: {e2}")
+        else:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="✅ Ваш пост опубликован в канале",
+                reply_to_message_id=data["user_message_id"],
+            )
         if data.get("admin_chat_id"):
             await context.bot.send_message(
                 chat_id=data["admin_chat_id"],
@@ -184,6 +205,19 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("accept:"):
         _, user_id_str, user_message_id_str = data.split(":")
         group_message_id = query.message.message_id
+        user_id = int(user_id_str)
+        user_message_id = int(user_message_id_str)
+
+        try:
+            notify = await context.bot.send_message(
+                chat_id=user_id,
+                text="✅ Ваш пост принят и будет опубликован в канале",
+                reply_to_message_id=user_message_id,
+            )
+            context.bot_data.setdefault("accepted_notify", {})[user_message_id] = notify.message_id
+        except Exception as e:
+            print(f"Не удалось уведомить {user_id}: {e}")
+
         await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton(
                 "🚀 Опубликовать сразу",
@@ -284,8 +318,8 @@ def main():
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, schedule_time_handler))
-    app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, message_handler))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, schedule_time_handler))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, message_handler))
     app.add_handler(CallbackQueryHandler(on_button))
 
     print("Бот запущен")
